@@ -6,6 +6,9 @@ import com.jobscraper.entity.ListPage;
 import com.jobscraper.repository.ItemRepository;
 import com.jobscraper.repository.ListPageRepository;
 import com.microsoft.playwright.*;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
 import org.jsoup.nodes.Element;
@@ -16,6 +19,11 @@ import org.springframework.web.client.RestTemplate;
 
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 @Service
 public class JobDataService {
@@ -26,14 +34,40 @@ public class JobDataService {
     private final RestTemplate restTemplate;
     private final ListPageRepository listPageRepository;
     private final ItemRepository itemRepository;
+    private final Playwright playwright;
+    private final Browser browser;
 
     public JobDataService(RestTemplate restTemplate, ListPageRepository listPageRepository, ItemRepository itemRepository) {
         this.restTemplate = restTemplate;
         this.listPageRepository = listPageRepository;
         this.itemRepository = itemRepository;
+
+        this.playwright = Playwright.create();
+        this.browser = playwright.chromium().launch(new BrowserType.LaunchOptions().setHeadless(true));
     }
 
-    public boolean fetchAndSaveListPagesByIndustryAndPage(String industry, int page) {
+    public void fetchAndSaveAllListPages(String industry, int totalPages) throws InterruptedException {
+        ExecutorService pageExecutor = Executors.newFixedThreadPool(5); // пул для страниц
+        AtomicInteger totalSavedCount = new AtomicInteger(0);
+
+        for (int page = 0; page < totalPages; page++) {
+            int currentPage = page;
+            pageExecutor.submit(() -> {
+                try {
+                    fetchAndSaveListPagesByIndustryAndPage(industry, currentPage, totalSavedCount);
+                } catch (Exception e) {
+                    System.err.println("Ошибка при обработке страницы " + currentPage + ": " + e.getMessage());
+                }
+            });
+        }
+
+        pageExecutor.shutdown();
+        pageExecutor.awaitTermination(1, TimeUnit.HOURS);
+
+        System.out.println("Всего сохранено вакансий: " + totalSavedCount.get());
+    }
+
+    public boolean fetchAndSaveListPagesByIndustryAndPage(String industry, int page, AtomicInteger totalSavedCount) {
         HttpHeaders headers = createHeaders(industry);
 
         Map<String, Object> filters = new HashMap<>();
@@ -54,84 +88,86 @@ public class JobDataService {
         );
 
         ApiResponse apiResponse = responseJobs.getBody();
-
-        if (apiResponse == null || apiResponse.getResults() == null) {
-            System.out.println("Нет данных по вакансиям для индустрии " + industry);
-            return false;
-        }
+        if (apiResponse == null || apiResponse.getResults() == null) return false;
 
         List<ApiResponse.Job> jobs = apiResponse.getResults().getJobs();
-        if (jobs == null || jobs.isEmpty()) {
-            System.out.println("Пустой список вакансий для индустрии " + industry + " на странице " + page);
-            return false;
-        }
+        if (jobs == null || jobs.isEmpty()) return false;
 
-        int savedCount = 0;
+        ExecutorService jobExecutor = Executors.newFixedThreadPool(10); // пул для вакансий
+        List<Future<?>> futures = new ArrayList<>();
+
         for (ApiResponse.Job job : jobs) {
-            if (job == null) {
-                System.out.println("Job is null, пропускаем...");
-                continue;
-            }
-
-            Document doc;
-            try {
-                doc = Jsoup.connect(jobFunctionUrls().get(industry)).get();
-                System.out.println("Загружена страница вакансии: " + job.getUrl());
-            } catch (IOException e) {
-                System.err.println("Ошибка загрузки страницы: " + job.getUrl() + ", ошибка: " + e.getMessage());
-                continue;
-            }
-
-            ApiResponse.Organization organization = job.getOrganization();
-
-            ListPage listPage = new ListPage();
-            listPage.setJobFunction(industry);
-            listPage.setCountJobs(apiResponse.getResults().getCount());
-            String url = "https://jobs.techstars.com/companies/" + job.getOrganization().getSlug() + "/jobs/" + job.getSlug();
-            listPage.setUrl(url);
-            listPage.setTags(getTags(organization, job));
-
-            Item item = new Item();
-            item.setPositionName(job.getTitle());
-            item.setUrl(job.getUrl());
-            item.setLogoUrl(organization.getLogoUrl());
-            item.setOrganizationTitle(organization.getName());
-            item.setAddress(String.join(", ", job.getSearchableLocations()));
-            item.setPostedDate( new Date(job.getCreatedAt() * 1000));
-
-            try {
-                doc = Jsoup.connect(url).get();
-                if (doc == null) {
-                    System.err.println("Не удалось загрузить страницу вакансии: " + url);
-                    continue;
-                }
-
-                Elements laborFunctions = doc.select("div.sc-beqWaB.bpXRKw");
-                if (laborFunctions.size() > 1) {
-                    item.setLaborFunction(laborFunctions.get(1).text());
-                } else {
-                    System.err.println("Не найден элемент с классом 'sc-beqWaB bpXRKw' на странице: " + url);
-                    item.setLaborFunction(null);
-                }
-
-                Element descriptionElement = doc.selectFirst("div[data-testid=careerPage]");
-                if (descriptionElement != null) {
-                    item.setDescription(descriptionElement.text().trim().replaceAll("\\s+", " "));
-                } else {
-                    System.err.println("Не найден элемент с data-testid='careerPage' на странице: " + url);
-                    item.setDescription(null);
-                }
-            } catch (IOException e) {
-                throw new NullPointerException();
-            }
-
-            listPageRepository.save(listPage);
-            itemRepository.save(item);
-            savedCount++;
+            futures.add(jobExecutor.submit(() -> processJob(job, industry, apiResponse.getResults().getCount(), totalSavedCount)));
         }
 
-        System.out.println("Сохранено вакансий: " + savedCount + " для индустрии " + industry + ", страница " + page);
+        for (Future<?> f : futures) {
+            try { f.get(); } catch (Exception e) { e.printStackTrace(); }
+        }
+
+        jobExecutor.shutdown();
+
         return true;
+    }
+
+    public void processJob(ApiResponse.Job job, String industry, int totalCount, AtomicInteger savedCount) {
+        ApiResponse.Organization organization = job.getOrganization();
+        if (organization == null) return;
+
+        String jobUrl = job.getUrl();
+        if (jobUrl == null || jobUrl.isBlank()) return;
+
+        ListPage listPage = new ListPage();
+        listPage.setJobFunction(industry);
+        listPage.setCountJobs(totalCount);
+        listPage.setUrl(jobUrl);
+        listPage.setTags(getTags(organization, job));
+
+        Item item = new Item();
+        item.setPositionName(job.getTitle());
+        String url = "https://jobs.techstars.com/companies/" + job.getOrganization().getSlug() + "/jobs/" + job.getSlug();
+        item.setUrl(url);
+        item.setLogoUrl(organization.getLogoUrl());
+        item.setOrganizationTitle(organization.getName());
+        item.setAddress(String.join(", ", job.getSearchableLocations()));
+        item.setPostedDate(new Date(job.getCreatedAt() * 1000));
+
+        Document doc = null;
+        int attempts = 0;
+        while (doc == null && attempts < 2) { // попробуем до 3 раз
+            try {
+                doc = Jsoup.connect(url)
+                        .userAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
+                        .timeout(15000) // 15 секунд
+                        .get();
+            } catch (IOException e) {
+                attempts++;
+                try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+            }
+        }
+
+        if (doc != null) {
+            Elements laborFunctions = doc.select("div.sc-beqWaB.bpXRKw");
+            if (laborFunctions.size() > 1) item.setLaborFunction(laborFunctions.get(1).text());
+
+            if (job.isHasDescription()) {
+                Element descriptionElement = doc.selectFirst("div.sc-beqWaB.fmCCHr");
+                if (descriptionElement != null) {
+                    String description = descriptionElement.text().trim();
+                    item.setDescription(description.isEmpty() ? null : description);
+                }
+            }
+        } else {
+            System.err.println("Пропущена вакансия, страница не загружена: " + url);
+        }
+
+        listPageRepository.save(listPage);
+        itemRepository.save(item);
+        savedCount.incrementAndGet();
+    }
+
+    public void closeBrowser() {
+        if (browser != null) browser.close();
+        if (playwright != null) playwright.close();
     }
 
     private HttpHeaders createHeaders(String refererIndustry) {
@@ -156,38 +192,34 @@ public class JobDataService {
         return headers;
     }
 
-    public void fetchAndSaveAllListPages() {
+    public void fetchAndSaveAllListPages() throws InterruptedException {
         List<String> industries = List.of(
-                "Accounting & Finance",
-                "Administration",
-                "Compliance / Regulatory",
-                "Customer Service",
-                "Data Science",
-                "Design",
-                "IT",
-                "Legal",
-                "Marketing & Communications",
-                "Operations",
-                "Other Engineering",
-                "People & HR",
-                "Product",
-                "Quality Assurance",
-                "Sales & Business Development",
+                "Accounting & Finance", "Administration", "Compliance / Regulatory",
+                "Customer Service", "Data Science", "Design", "IT",
+                "Legal", "Marketing & Communications", "Operations",
+                "Other Engineering", "People & HR", "Product",
+                "Quality Assurance", "Sales & Business Development",
                 "Software Engineering"
         );
 
-        for (String industry : industries) {
-            int page = 0;
-            boolean hasMore = true;
+        ExecutorService industryExecutor = Executors.newFixedThreadPool(3); // 3 индустрии одновременно
 
-            while (hasMore) {
-                hasMore = fetchAndSaveListPagesByIndustryAndPage(industry, page);
-                if (hasMore) {
+        for (String industry : industries) {
+            industryExecutor.submit(() -> {
+                int page = 0;
+                boolean hasMore = true;
+                AtomicInteger totalSavedCount = new AtomicInteger(0);
+
+                while (hasMore) {
+                    hasMore = fetchAndSaveListPagesByIndustryAndPage(industry, page, totalSavedCount);
                     page++;
                 }
-            }
-            System.out.println("Данные по индустрии " + industry + " загружены и сохранены!");
+                System.out.println("Данные по индустрии " + industry + " загружены и сохранены! Всего вакансий: " + totalSavedCount.get());
+            });
         }
+
+        industryExecutor.shutdown();
+        industryExecutor.awaitTermination(2, TimeUnit.HOURS);
     }
 
     public String getTags(ApiResponse.Organization organization, ApiResponse.Job job) {

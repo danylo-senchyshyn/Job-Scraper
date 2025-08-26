@@ -20,6 +20,7 @@ public class AppStartupConfig {
     public CommandLineRunner runOnStartup() {
         return args -> {
             jobDataService.fetchAndSaveAllListPages();
+            jobDataService.closeBrowser();
             System.out.println("Детали вакансий успешно распарсены и сохранены!");
         };
     }

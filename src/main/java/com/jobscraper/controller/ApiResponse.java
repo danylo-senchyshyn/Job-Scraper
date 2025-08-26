@@ -38,6 +38,7 @@ public class ApiResponse {
         private String compensationPeriod;
         private Organization organization;
         private List<String> locations;
+        @JsonProperty("has_description")
         private boolean hasDescription;
         private String slug;
         private String seniority;
