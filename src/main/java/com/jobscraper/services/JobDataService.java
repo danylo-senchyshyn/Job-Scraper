@@ -42,10 +42,16 @@ public class JobDataService {
 
     private final ExecutorService industryExecutor = Executors.newFixedThreadPool(3); // 3 индустрии одновременно
     private final ExecutorService jobExecutor = Executors.newCachedThreadPool();      // динамический пул вакансий
+    private final Semaphore httpSemaphore = new Semaphore(20); // не более 20 одновременных запросов
 
     private  final List<String> industries = List.of("Accounting & Finance", "Administration", "Compliance / Regulatory", "Customer Service", "Data Science", "Design", "IT", "Legal", "Marketing & Communications", "Operations", "Other Engineering", "People & HR", "Product", "Quality Assurance", "Sales & Business Development", "Software Engineering");
 
     private final AtomicInteger jobsParsedCounter = new AtomicInteger(0);
+    private final List<Item> batchItems = Collections.synchronizedList(new ArrayList<>());
+    private final List<ListPage> batchPages = Collections.synchronizedList(new ArrayList<>());
+
+    private boolean withDescriptionAndLaborFunction;
+    private volatile boolean stopProcessing;
 
     public JobDataService(ListPageRepository listPageRepository, ItemRepository itemRepository, StatisticsRepository statisticsRepository) {
         this.listPageRepository = listPageRepository;
@@ -54,19 +60,18 @@ public class JobDataService {
     }
 
     public void fetchAndSaveAllListPages() {
-        long start = System.currentTimeMillis();
+        //stopProcessing = false;
         itemRepository.deleteAll();
         listPageRepository.deleteAll();
         jobsParsedCounter.set(0);
 
+        long start = System.currentTimeMillis();
         List<CompletableFuture<Void>> futures = new ArrayList<>();
         for (String industry : industries) {
             CompletableFuture<Void> f = CompletableFuture.runAsync(() -> fetchIndustry(industry), industryExecutor);
             futures.add(f);
         }
         CompletableFuture.allOf(futures.toArray(new CompletableFuture[0])).join();
-
-        //shutdownExecutors();
 
         long end = System.currentTimeMillis();
         long duration = end - start;
@@ -79,6 +84,7 @@ public class JobDataService {
         stats.setTotalJobsParsed(jobsParsedCounter.get());
         stats.setTotalTimeMs(duration);
         stats.setLastFetch(LocalDateTime.now());
+        stats.setDecriptionsAndLaborFunctions(withDescriptionAndLaborFunction);
         statisticsRepository.save(stats);
     }
 
@@ -99,11 +105,13 @@ public class JobDataService {
 
     private CompletableFuture<Boolean> fetchPage(String industry, int page) {
         Map<String, Object> body = Map.of(
-                "hitsPerPage", 12,
+                "hitsPerPage", withDescriptionAndLaborFunction == true ? 10 : 50,
                 "page", page,
                 "query", "",
                 "filters", Map.of("job_functions", new String[]{industry})
         );
+
+
 
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(URL_JOBS))
@@ -148,10 +156,15 @@ public class JobDataService {
     }
 
     private void processJob(JSONObject jobJson, String industry) {
+        //if (isLimitReached()) return;
+
         long start = System.currentTimeMillis();
         try {
+            httpSemaphore.acquire();
+
             JSONObject orgJson = jobJson.optJSONObject("organization");
 
+            // --- Формируем ListPage ---
             ListPage listPage = new ListPage();
             listPage.setJobFunction(industry);
             listPage.setUrl(jobJson.optString("url", ""));
@@ -160,6 +173,7 @@ public class JobDataService {
                     : 0);
             listPage.setTags(getTags(industry, jobJson));
 
+            // --- Формируем Item ---
             Item item = new Item();
             item.setPositionName(jobJson.optString("title", ""));
             String url = "https://jobs.techstars.com/companies/"
@@ -169,8 +183,9 @@ public class JobDataService {
             item.setUrl(url);
             item.setLogoUrl(orgJson != null ? orgJson.optString("logo_url", "") : "");
             item.setOrganizationTitle(orgJson != null ? orgJson.optString("name", "") : "");
+            item.setPostedDate(new Date(jobJson.optLong("created_at", 0) * 1000));
 
-            // locations
+            // --- Locations ---
             JSONArray locations = jobJson.optJSONArray("searchable_locations");
             if (locations != null) {
                 List<String> locs = new ArrayList<>();
@@ -180,54 +195,57 @@ public class JobDataService {
                 item.setAddress(String.join(", ", locs));
             }
 
-            // posted date
-            long createdAt = jobJson.optLong("created_at", 0);
-            if (createdAt > 0) {
-                item.setPostedDate(new Date(createdAt * 1000));
-            }
-
-            // description and labor function
-            Document doc = null;
-            int attempts = 0;
-            while (doc == null && attempts < 2) { // попробуем до 3 раз
-                try {
-                    doc = Jsoup.connect(url)
-                            .userAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36")
-                            .timeout(15000) // 15 секунд
-                            .get();
-                } catch (IOException e) {
-                    attempts++;
-                    try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+            // --- HTML Parsing (Jsoup) ---
+            if (withDescriptionAndLaborFunction) {
+                Document doc = null;
+                int attempts = 0;
+                while (doc == null && attempts < 3) {
+                    try {
+                        doc = Jsoup.connect(url)
+                                .userAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
+                                .timeout(15000)
+                                .get();
+                    } catch (IOException e) {
+                        attempts++;
+                        try { Thread.sleep(2000); } catch (InterruptedException ignored) {}
+                    }
                 }
-            }
+                if (doc != null) {
+                    Elements laborFunctions = doc.select("div.sc-beqWaB.bpXRKw");
+                    item.setLaborFunction(laborFunctions.size() > 1 ? laborFunctions.get(1).text() : industry);
 
-            //System.out.println(jobJson.getBoolean("has_description") + " - " + jobJson.optString("title", ""));
-            if (doc != null) {
-                Elements laborFunctions = doc.select("div.sc-beqWaB.bpXRKw");
-                if (laborFunctions.size() > 1) {
-                    item.setLaborFunction(laborFunctions.get(1).text());
-                } else {
-                    item.setLaborFunction(industry);
-                }
-
-                //System.out.print(jobJson.getBoolean("has_description"));
-                if (jobJson.getBoolean("has_description")) {
-                    Element descriptionElement = doc.selectFirst("div.sc-beqWaB.fmCCHr");
-                    if (descriptionElement != null) {
-                        String description = descriptionElement.text().trim();
-                        item.setDescription(description.isEmpty() ? null : description);
-                    } else {
-                        System.out.println("Не найдно описание - " + item.getPositionName() + " - " + url + " industry: " + industry);
+                    if (jobJson.optBoolean("has_description", false)) {
+                        Element descEl = doc.selectFirst("div.sc-beqWaB.fmCCHr");
+                        if (descEl != null) {
+                            String description = descEl.text().trim();
+                            item.setDescription(description.isEmpty() ? null : description);
+                        }
                     }
                 }
             }
 
-            CompletableFuture.runAsync(() -> listPageRepository.save(listPage), jobExecutor);
-            CompletableFuture.runAsync(() -> itemRepository.save(item), jobExecutor);
+            // --- Batch Save ---
+            synchronized(this) {
+                batchItems.add(item);
+                batchPages.add(listPage);
+
+                if(batchItems.size() >= 50) {
+                    itemRepository.saveAll(batchItems);
+                    batchItems.clear();
+                    listPageRepository.saveAll(batchPages);
+                    batchPages.clear();
+                }
+            }
         } catch (JSONException e) {
             e.printStackTrace();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         } finally {
-            jobsParsedCounter.incrementAndGet();
+            httpSemaphore.release();
+            int processed = jobsParsedCounter.incrementAndGet();
+            if (processed >= 1000) {
+                // stopProcessing = true; // ставим флаг остановки
+            }
 
             long end = System.currentTimeMillis();
             long duration = end - start;
@@ -316,5 +334,34 @@ public class JobDataService {
         } else {
             return String.format("%d мс - ", ms);
         }
+    }
+
+    public void welcome(){
+        Scanner scanner = new Scanner(System.in);
+        System.out.println();
+        String l1 = "1. with description and labor function";
+        String l2 = "2. without description and labor function";
+
+        System.out.println(l1);
+        System.out.println(l2);
+        System.out.print("Select mode (1 or 2): ");
+
+        int choice = scanner.nextInt();
+        System.out.println(choice);
+
+        if (choice == 1) {
+            withDescriptionAndLaborFunction = true;
+            fetchAndSaveAllListPages();
+        } else if (choice == 2) {
+            withDescriptionAndLaborFunction = false;
+            fetchAndSaveAllListPages();
+        } else {
+            System.out.println("Invalid input. Please enter 1 or 2.");
+            welcome();
+        }
+    }
+
+    private boolean isLimitReached() {
+        return stopProcessing || jobsParsedCounter.get() >= 1000;
     }
 }

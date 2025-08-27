@@ -14,13 +14,10 @@ public class Statistics {
     @Id
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
-
-    @Column(name = "total_jobs_parsed", nullable = false)
     private int totalJobsParsed;
-
-    @Column(name = "total_time_ms", nullable = false)
     private long totalTimeMs;
-
-    @Column(name = "last_fetch", nullable = false)
     private LocalDateTime lastFetch;
+
+    @Column(nullable = false, columnDefinition = "boolean default false")
+    private boolean decriptionsAndLaborFunctions;
 }

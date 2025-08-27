@@ -20,6 +20,7 @@ public class AppStartupConfig {
     @Bean
     public CommandLineRunner runOnStartup() {
         return args -> {
+            jobDataService.welcome();
             for (int i = 0; i < 5; i++) {
                 jobDataService.fetchAndSaveAllListPages();
             }
