@@ -3,6 +3,7 @@ package com.jobscraper.entity;
 import jakarta.persistence.*;
 import lombok.Getter;
 import lombok.Setter;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
 
 @Entity
 @Table(name = "list_page")

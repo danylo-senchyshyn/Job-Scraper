@@ -9,7 +9,10 @@ import org.springframework.web.client.RestTemplate;
 public class JobScraperApplication {
 
     public static void main(String[] args) {
+        System.setProperty("java.io.tmpdir", "/tmp/job-scraper"); // создаст tmp специально для приложения
+        new java.io.File("/tmp/job-scraper").mkdirs(); // на случай, если папка не существует
         SpringApplication.run(JobScraperApplication.class, args);
+
     }
 
     @Bean

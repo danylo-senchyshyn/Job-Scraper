@@ -2,15 +2,16 @@ package com.jobscraper.entity;
 
 import com.fasterxml.jackson.annotation.JsonProperty;
 import jakarta.persistence.*;
+import lombok.Data;
 import lombok.Getter;
 import lombok.Setter;
+import org.springframework.data.jpa.repository.config.EnableJpaRepositories;
 
 import java.util.Date;
 
 @Entity
 @Table(name = "item")
-@Getter
-@Setter
+@Data
 public class Item {
 
     @Id

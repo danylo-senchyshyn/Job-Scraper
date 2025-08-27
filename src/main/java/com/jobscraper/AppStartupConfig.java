@@ -6,6 +6,7 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 @Configuration
 public class AppStartupConfig {
@@ -19,9 +20,10 @@ public class AppStartupConfig {
     @Bean
     public CommandLineRunner runOnStartup() {
         return args -> {
-            jobDataService.fetchAndSaveAllListPages();
-            jobDataService.closeBrowser();
-            System.out.println("Детали вакансий успешно распарсены и сохранены!");
+            for (int i = 0; i < 5; i++) {
+                jobDataService.fetchAndSaveAllListPages();
+            }
+            jobDataService.shutdownExecutors();
         };
     }
 }
